@@ -1,0 +1,224 @@
+#!/bin/bash
+set -eu
+
+DRIS_COMMAND=${1:-}
+DRIS_SERVICE_NAME= # user-friendly name (eg: nginx)
+DOCKER_IMAGE=
+DOCKER_RUN_ARGS=
+DOCKER_RUN_OPTS=
+SYSTEMD_SERVICE_DIR=/etc/systemd/system
+SYSTEMD_SERVICE_SUFFIX=.docker
+SYSTEMD_SERVICE_NAME= # ${DRIS_SERVICE_NAME}.docker
+SYSTEMD_SERVICE_PATH= # ${SYSTEMD_SERVICE_DIR}/${SYSTEMD_SERVICE_NAME}.service
+
+fatal() { echo "FATAL: " "$@"; exit 1; }
+command -v systemctl &>/dev/null || fatal "'systemctl' not found."
+
+help() {
+  cat <<EOF
+docker-run-in-systemd
+  usage:
+    ${0} ps
+      List all DRIS service(s) registered in systemd.
+
+    ${0} run [DOCKER_RUN_OPTIONS] DOCKER_IMAGE [COMMAND] [ARG...]
+        Setup and run a new service in systemd.
+        Works as a 'drop-in' function for the 'docker run' command.
+        A _service name_ will automatically be infered from the DOCKER_IMAGE.
+
+        Example:
+          $ ${0} run -p 3000:80 -v /data/www:/usr/share/nginx/html:ro nginx:1.19
+
+    ${0} status <SERVICE>
+        Show the (systemd) status of a given service.
+
+        Example:
+          $ ${0} status nginx
+
+    ${0} start <SERVICE>
+        Start and enable a given service.
+        NOTE: the docker container will automatically restart on failure, and starts
+        automatically on boot, and when the 'docker.service' starts.
+
+        Example:
+          $ ${0} start nginx
+
+    ${0} stop <SERVICE>
+        Stop and disable a given service.
+        NOTE: the service is still present but it will no longer start automatically.
+        use the '${0} start' command to re-enable it.
+
+        Example:
+          $ ${0} stop nginx
+
+    ${0} restart <SERVICE>
+        Restart a given service.
+
+        Example:
+          $ ${0} restart nginx
+
+    ${0} rm <SERVICE>
+        Stop, disable and completely remove a given DRIS service.
+        NOTE: a confirmation will be prompted.
+
+        Example:
+          $ ${0} rm nginx
+
+    ${0} help
+        Show this message.
+EOF
+  exit 1
+}
+
+set_dris_service_name() {
+  local name=${1:?must provide a SERVICE_NAME}
+  DRIS_SERVICE_NAME=${name%%${SYSTEMD_SERVICE_SUFFIX}}
+  SYSTEMD_SERVICE_NAME=${DRIS_SERVICE_NAME}.docker
+  SYSTEMD_SERVICE_PATH=${SYSTEMD_SERVICE_DIR}/${SYSTEMD_SERVICE_NAME}.service
+}
+
+infer_service_name_from_docker_image() {
+  local image=${1:?must provide a DOCKER_IMAGE}  # quay.io/zlynch/pause:3.1
+  DOCKER_IMAGE_NAME=${image%:*}                  # quay.io/zlynch/pause
+  SERVICE_NAME=${DOCKER_IMAGE_NAME##*/}          # pause
+  set_dris_service_name "${SERVICE_NAME}"
+}
+
+parse_args() {
+  case "${DRIS_COMMAND}" in
+  run)
+    shift # skip the DRIS_COMMAND
+    [[ "${#}" -ge 1 ]] || help
+
+    while (( "$#" )); do
+      case "$1" in
+        # silently ignore docker run OPTIONS that won't make sense when running as a systemd service
+        -d|--detach| \
+        -i|--interactive| \
+        -t|--tty| \
+        --help)
+          shift ;;
+
+        # handle switches
+        --init| \
+        --no-healthcheck| \
+        --oom-kill-disable| \
+        --privileged| \
+        --publish-all| \
+        --read-only| \
+        --rm| \
+        --sig-proxy| \
+        -P)
+          DOCKER_RUN_OPTS="${DOCKER_RUN_OPTS:+${DOCKER_RUN_OPTS} }$1"
+          shift ;;
+
+        *)
+          # if DOCKER_IMAGE has been set, remaining args belongs to DOCKER_RUN_ARGS
+          if [[ -n "${DOCKER_IMAGE}" ]]; then
+            DOCKER_RUN_ARGS="${DOCKER_RUN_ARGS:+${DOCKER_RUN_ARGS} }$1"
+            shift
+
+          # otherwise, as DOCKER_IMAGE has not been set yet
+          else
+
+            # args that starts with a dash (eg: -v or --volume) should come with an associated value
+            if [[ "$1" = -* ]]; then
+                if [[ -n "${2:-}" ]] && [[ "${2-:0:1}" != "-" ]]; then
+                  DOCKER_RUN_OPTS="${DOCKER_RUN_OPTS:+${DOCKER_RUN_OPTS} }$1 $2"
+                  shift 2
+                else
+                  fatal "missing arg for $1?"
+                fi
+
+            # if it is a positional arg (not a --flag), it is the DOCKER_IMAGE
+            else
+              DOCKER_IMAGE="$1"
+              shift
+            fi
+          fi
+          ;;
+      esac
+    done
+
+    infer_service_name_from_docker_image "${DOCKER_IMAGE}"
+    ;;
+  status|start|stop|restart|rm)
+    [[ "${#}" -eq 2 ]] || help
+    set_dris_service_name "${2:-}"
+    shift 2
+    ;;
+  ps) : ;; # do nothing
+  *) help ;;
+  esac
+}
+
+dris:generate_systemd_unit_file() {
+  cat <<EOF >"${SYSTEMD_SERVICE_PATH}"
+[Unit]
+Description=Dockerized ${DRIS_SERVICE_NAME}
+Requires=docker.service
+After=docker.service
+
+[Service]
+TimeoutStartSec=0
+ExecStartPre=-/usr/bin/docker pull ${DOCKER_IMAGE}
+ExecStartPre=-/usr/bin/docker kill ${DRIS_SERVICE_NAME}
+ExecStartPre=-/usr/bin/docker rm ${DRIS_SERVICE_NAME}
+ExecStart=/usr/bin/docker run \
+  ${DOCKER_RUN_OPTS:-} \
+  --rm \
+  --init \
+  --name ${DRIS_SERVICE_NAME} \
+  ${DOCKER_IMAGE} \
+  ${DOCKER_RUN_ARGS:-}
+ExecStop=/usr/bin/docker stop ${DRIS_SERVICE_NAME}
+
+Restart=always
+
+[Install]
+WantedBy=multi-user.target docker.service
+EOF
+}
+
+dris:run() {
+  dris:generate_systemd_unit_file
+  systemctl daemon-reload
+  systemctl enable "${SYSTEMD_SERVICE_NAME}"
+  # using 'restart' command so the behavior is consistent when overriding an existing DRIS_SERVICE
+  systemctl restart "${SYSTEMD_SERVICE_NAME}"
+}
+
+dris:status() {
+  systemctl status "${SYSTEMD_SERVICE_NAME}"
+}
+
+dris:start() {
+  systemctl enable "${SYSTEMD_SERVICE_NAME}"
+  systemctl start "${SYSTEMD_SERVICE_NAME}"
+}
+
+dris:stop() {
+  systemctl stop "${SYSTEMD_SERVICE_NAME}"
+  systemctl disable "${SYSTEMD_SERVICE_NAME}"
+}
+
+dris:rm() {
+  [[ -f "${SYSTEMD_SERVICE_PATH}" ]] || fatal "Service ${DRIS_SERVICE_NAME} (${SYSTEMD_SERVICE_PATH}) not found."
+
+  read -p "ARE YOU SURE you want to stop and completely remove the service for '${DRIS_SERVICE_NAME}'? (Y|y) " -n 1 -r;
+  echo;
+  if [[ "${REPLY}" =~ ^[Yy]$ ]]; then
+    dris:stop
+    rm -f "${SYSTEMD_SERVICE_PATH}"
+    systemctl daemon-reload
+  fi
+}
+
+parse_args "$@"
+
+case "${DRIS_COMMAND}" in
+  restart) exec systemctl "${DRIS_COMMAND}" "${SYSTEMD_SERVICE_NAME}" ;;
+  ps) exec systemctl list-unit-files "*${SYSTEMD_SERVICE_SUFFIX}.service" ;;
+  status|start|stop|run|rm) "dris:${DRIS_COMMAND}" ;;
+  *) help ;;
+esac
